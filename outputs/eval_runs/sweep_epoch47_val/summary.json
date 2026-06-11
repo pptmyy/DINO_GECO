@@ -1,0 +1,32 @@
+{
+  "split": "val",
+  "checkpoint": "checkpoints\\DGECO2FSCD\\DGECO2FSCD_best_val_rmse.pth",
+  "image_count": 1286,
+  "combination_count": 60,
+  "best_by_mae": {
+    "combo_id": 52,
+    "split": "val",
+    "score_threshold": 0.25,
+    "score_ratio": 0.5,
+    "nms_iou": 0.25,
+    "threshold_mode": "static_ratio",
+    "score_quantile": 0.98,
+    "verification_mode": "none",
+    "verification_threshold": 0.0,
+    "verification_topk": 0,
+    "n": 1286,
+    "gt_avg": 62.17340590979782,
+    "pred_avg": 53.88335925349922,
+    "mae": 20.53421461897356,
+    "rmse": 50.35140125246855,
+    "signed_error": -8.2900466562986,
+    "over_count": 459,
+    "under_count": 735,
+    "equal_count": 92,
+    "avg_pre_nms": 78.36547433903577,
+    "avg_post_nms": 53.900466562986004,
+    "avg_post_verify": 53.900466562986004,
+    "avg_effective_threshold": 0.37454911484781356,
+    "density_abs_gap": 163.37405944361842
+  }
+}

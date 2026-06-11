@@ -1,0 +1,7 @@
+Loading pretrained weights from src/models/backbones/checkpoint/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+loading annotations into memory...
+Done (t=0.17s)
+creating index...
+index created!
+Saved sweep to outputs\eval_runs\sweep_postprocess_v2_val | combinations 288 | best combo 30 MAE 20.534 RMSE 50.346 signed -8.292
+

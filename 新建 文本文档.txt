@@ -1,0 +1,192 @@
+• 我查了近几年 few-shot / open-world object counting 方向，结合你当前 DINO-SAM-GECO2 的结构，我认为还有一些值得优化的
+  点，但优先级不一样。
+
+  你的项目当前核心路径大致是：
+
+  image -> DINOv3Adapter -> vision_features / backbone_fpn
+  exemplar boxes -> ROI Align -> prototype embeddings
+  prototype + image features -> QueryGenerator
+  -> centerness head + bbox head
+  -> NMS count
+
+  这属于 检测式 few-shot counting，和 GECO2/LOCA/CountGD/PseCo 这些方向比较接近。
+
+  最值得优先做的架构优化
+
+  1. 增强 exemplar prototype 适配，而不是只池化 exemplar 特征
+
+  LOCA 的核心观点是：简单 feature pooling 会忽略 exemplar 的形状、尺寸、长宽比信息，影响定位和计数；它用 iterative
+  prototype adaptation 融合外观和形状信息，并在 FSC147 上提升明显。
+
+  你项目里已经有：
+
+  shape_or_objectness(box_hw)
+  prototype_embeddings = torch.cat([exemplars, shape], dim=1)
+
+  这是对的，但还比较浅。可以进一步做：
+
+  exemplar prototype 与 image feature 多轮 cross-attention
+  每个 exemplar 独立生成 prototype，再做 attention 聚合
+  加入 exemplar bbox 的 w/h/aspect/area/scale embedding
+  让 prototype 在高/中/低尺度分别适配，而不是共享一个原型
+
+  优先级：高。
+  原因：你的任务是 few-shot counting，exemplar 表达质量直接决定 false positive / false negative。
+
+  2. 做更明确的跨尺度 query aggregation
+
+  GECO2 论文明确指出，仅仅合并不同分辨率 backbone features 不够，尺度变化和小目标密集场景仍然困难；它提出逐级聚合
+  exemplar-specific 信息，形成高分辨率 dense queries，并报告更好的精度、速度和显存表现。
+
+  你当前 DINOv3Adapter 已经取多层 DINO 特征并融合：
+
+  out_feature_indexes = (2, 5, 8, 11)
+  backbone_fpn = [c1, c2, c3]
+
+  但后续主干预测主要依赖 vision_features = c3，高分辨率层更多是辅助进入 QueryGenerator。可以尝试：
+
+  每个尺度独立产生 query response / objectness
+  从低分辨率语义 query 逐级 refine 到高分辨率 query
+  小目标使用高分辨率 head，大目标使用低分辨率 head
+  不同尺度预测后做 learned fusion，而不是简单 concat/conv
+
+  优先级：高。
+  原因：日志里的 RMSE 很高，很可能有 dense/small-object 场景大错样本。
+
+  3. 加入 count consistency / density auxiliary head
+
+  你的项目是检测式计数，最终靠 NMS 后 box 数量：
+
+  num_objects_pred = len(count_predictions(outputs[idx]))
+
+  检测式方法可解释性好，但在密集小目标上很容易漏检。可以加一个轻量 density/count auxiliary branch：
+
+  centerness/density map head -> sum 得到 count_pred
+  loss_count = SmoothL1(sum(pred_density), gt_count)
+  loss_density = 可选 L2/BCE/focal heatmap
+
+  不一定要替代检测分支，而是作为辅助监督：
+
+  total_loss = detection_loss + λ_count * count_consistency_loss
+
+  优先级：中高。
+  原因：你的 best 模型按 val_rmse 保存，RMSE 对严重错数很敏感；count consistency 可以直接约束总数。
+
+  4. 改进候选点筛选和 NMS
+
+  当前阈值逻辑是：
+
+  scores > scores.max() / 8
+
+  这个非常依赖单张图最大响应。如果最大响应异常，候选数会大幅波动，MAE/RMSE 会抖。
+
+  可以试：
+
+  scores.sigmoid() > fixed_threshold
+  top-k before NMS
+  dynamic threshold + absolute minimum threshold
+  Soft-NMS 或 class-agnostic box voting
+  限制每张图最大候选数，防止 dense false positives
+
+  优先级：高。
+  原因：这不大改架构，但可能明显改善计数稳定性。
+
+  5. 对 DINOv3 用 adapter/LoRA，而不是直接全量解冻
+
+  你现在选择：
+
+  freeze self.dinov3
+  train DINOv3Adapter sta/convs/norms
+
+  这是合理的。下一步如果 adapter 仍不够，可以考虑：
+
+  DINOv3 最后 2-4 个 block 加 LoRA
+  或只解冻最后几个 norm / attention projection
+  lr = 1e-6 ~ 5e-6
+
+  不要直接全量 fine-tune DINOv3，显存和过拟合风险都高。
+
+  优先级：中。
+  原因：当前更关键的是 loss、query、多尺度和候选筛选。
+
+  6. 更有效利用 SAM：作为 mask/box refinement，而不是全流程依赖
+
+  PseCo 的思路是先点定位，再用 SAM 产生 mask proposal，并通过分类/蒸馏做 count。它也指出 SAM 方案会遇到效率和小目标拥挤
+  问题，所以不能简单“全图 segment anything”。
+
+  你项目如果要继续引入 SAM，建议只做：
+
+  对高置信候选点/box 调 SAM refinement
+  用 SAM mask 反推更准 bbox
+  训练时用 SAM mask 生成辅助 objectness/mask target
+  对大目标用 SAM refinement，小目标不强依赖 SAM
+
+  优先级：中。
+  原因：SAM 对边界有帮助，但全量调用会非常吃显存/时间，小目标密集场景也未必稳定。
+
+  训练和损失层面继续优化
+
+  你已经做了两件关键修复：
+
+  loss_ce -> BCEWithLogits
+  去掉全图 mask fallback
+
+  下一步可以考虑：
+
+  BCEWithLogits -> Focal Loss
+  正负样本 hard negative mining
+  loss_giou / loss_bbox / loss_ce 显式权重化
+  val loss 和 train loss 统一口径
+  记录 per-category / per-count-range 指标
+
+  特别建议增加这些分析：
+
+  按 GT count 分桶:
+    0-10, 10-50, 50-100, 100+
+
+  按目标尺寸分桶:
+    small, medium, large
+
+  按错误类型:
+    over-count / under-count
+
+  因为 few-shot counting 最常见的问题不是平均都差，而是某些 dense/small 类别严重崩。
+
+  我建议的实验顺序
+
+  不要一次改太多。建议这样排：
+
+  A. 稳定性实验
+  1. 当前修复版 loss + AMP + train adapter
+  2. 记录 loss 分项、mask、centerness、pred count
+  3. 跑 2-3 epoch 看是否还有 loss > 100
+
+  B. 低成本结构实验
+  4. 改 count_predictions 阈值策略
+  5. 加 top-k before NMS
+  6. 加 count consistency loss
+
+  C. 中等成本结构实验
+  7. 多尺度 head / scale-aware query refinement
+  8. exemplar prototype 多轮 adaptation
+
+  D. 高成本实验
+  9. DINOv3 LoRA / partial unfreeze
+  10. SAM mask refinement
+
+  最推荐你现在做的 3 个优化
+
+  1. 改候选筛选: sigmoid threshold + top-k + NMS
+  2. 加 count consistency auxiliary loss
+  3. 强化 prototype adaptation: exemplar-image cross-attention 多轮更新
+
+  这三项最贴合你当前项目的问题：RMSE 高、计数不稳定、few-shot exemplar 表达不足。
+
+  参考资料：
+
+  - GECO2: https://arxiv.org/abs/2511.08048
+  - LOCA: https://arxiv.org/abs/2211.08217
+  - CountGD: https://arxiv.org/abs/2407.04619
+  - CounTR: https://huggingface.co/papers/2208.13721
+  - PseCo: https://arxiv.org/abs/2311.12386
+  - SAM counting study: https://arxiv.org/abs/2304.10817
