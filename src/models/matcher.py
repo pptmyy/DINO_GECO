@@ -24,6 +24,40 @@ class PointLossHungarianMatcher(nn.Module):
         self.cost_giou = cost_giou
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
 
+    @staticmethod
+    def _box_centers(boxes):
+        return 0.5 * (boxes[:, :2] + boxes[:, 2:])
+
+    def _fallback_match_zero_iou_gt(self, out_bbox, tgt_bbox, matched_pred, matched_gt, zero_iou_gt):
+        if zero_iou_gt.numel() == 0:
+            return matched_pred, matched_gt
+
+        keep = ~torch.isin(matched_gt, zero_iou_gt)
+        final_pred = matched_pred[keep].clone()
+        final_gt = matched_gt[keep].clone()
+        used_pred = set(final_pred.cpu().tolist())
+
+        pred_centers = self._box_centers(out_bbox)
+        gt_centers = self._box_centers(tgt_bbox)
+        distances = torch.cdist(pred_centers, gt_centers[zero_iou_gt], p=2)
+
+        for local_gt_idx, gt_idx in enumerate(zero_iou_gt):
+            order = torch.argsort(distances[:, local_gt_idx])
+            chosen = None
+            for pred_idx in order.cpu().tolist():
+                if pred_idx not in used_pred:
+                    chosen = pred_idx
+                    break
+            if chosen is None:
+                continue
+            used_pred.add(chosen)
+            final_pred = torch.cat(
+                [final_pred, torch.as_tensor([chosen], dtype=torch.int64, device=out_bbox.device)]
+            )
+            final_gt = torch.cat([final_gt, gt_idx.reshape(1).to(device=out_bbox.device)])
+
+        return final_pred, final_gt
+
     def forward(self, outputs, targets, ref_points=None):
         """ Performs the matching
 
@@ -76,23 +110,37 @@ class PointLossHungarianMatcher(nn.Module):
             sizes = [len(v["boxes"]) for v in targets]
             indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
 
-            non_mathced_gt_bbox_idx = \
-                np.nonzero(np.logical_not(np.isin(np.array([i for i in range(tgt_bbox.shape[0])]), indices[0][1])))[0]
-            non_mathced_gt_bbox_idx = np.concatenate(
-                (non_mathced_gt_bbox_idx, torch.where(iou.max(dim=0)[0] == 0)[0].cpu().numpy()))
-            non_mathced_gt_bbox_idx = [torch.tensor(non_mathced_gt_bbox_idx, dtype=torch.int64).unique()]
-            remove_mask = np.logical_not(np.isin(indices[0][1], non_mathced_gt_bbox_idx[
-                0].cpu()))
-            ind0 = indices[0][0][remove_mask]
-            ind1 = indices[0][1][remove_mask]
-            non_mathced_pred_bbox_idx = \
-                np.nonzero(np.logical_not(np.isin(np.array([i for i in range(out_bbox.shape[0])]), ind0)))[0]
-
             device = out_bbox.device
+            matched_pred = torch.as_tensor(indices[0][0], dtype=torch.int64, device=device)
+            matched_gt = torch.as_tensor(indices[0][1], dtype=torch.int64, device=device)
+            zero_iou_gt = torch.where(iou.max(dim=0)[0] == 0)[0].to(device=device)
+            matched_pred, matched_gt = self._fallback_match_zero_iou_gt(
+                out_bbox,
+                tgt_bbox,
+                matched_pred,
+                matched_gt,
+                zero_iou_gt,
+            )
+            all_gt = torch.arange(tgt_bbox.shape[0], dtype=torch.int64, device=device)
+            if matched_gt.numel() > 0:
+                gt_unmatched_mask = ~torch.isin(all_gt, matched_gt)
+                pred_unmatched_mask = ~torch.isin(
+                    torch.arange(out_bbox.shape[0], dtype=torch.int64, device=device),
+                    matched_pred,
+                )
+            else:
+                gt_unmatched_mask = torch.ones_like(all_gt, dtype=torch.bool)
+                pred_unmatched_mask = torch.ones(out_bbox.shape[0], dtype=torch.bool, device=device)
+            non_mathced_gt_bbox_idx = [all_gt[gt_unmatched_mask]]
+            ind0 = matched_pred
+            ind1 = matched_gt
+            non_mathced_pred_bbox_idx = \
+                torch.arange(out_bbox.shape[0], dtype=torch.int64, device=device)[pred_unmatched_mask].cpu().numpy()
+
             match_indexes = [
                 (
-                    torch.as_tensor(ind0, dtype=torch.int64, device=device),
-                    torch.as_tensor(ind1, dtype=torch.int64, device=device),
+                    ind0.to(dtype=torch.int64, device=device),
+                    ind1.to(dtype=torch.int64, device=device),
                 )
             ]
             return match_indexes, non_mathced_gt_bbox_idx, non_mathced_pred_bbox_idx

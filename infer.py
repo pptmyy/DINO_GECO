@@ -15,6 +15,7 @@ from torchvision import transforms as T
 from arg_parser import get_argparser
 from src.datasets.data import FSC147DATASET, pad_collate_test, resize_and_pad
 from src.models.DGECO import build_model
+from src.utils.checkpoint import load_model_state_dict
 from src.utils.postprocess import filter_detections
 from src.utils.verification import verify_detections
 
@@ -166,19 +167,10 @@ def count_valid_gt_boxes(gt_bboxes_i: torch.Tensor) -> int:
     return int(valid_mask.sum().item())
 
 
-def normalize_checkpoint_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if not state_dict:
-        return state_dict
-
-    has_module = all(k.startswith("module.") for k in state_dict.keys())
-    if has_module:
-        return {k[len("module.") :]: v for k, v in state_dict.items()}
-    return state_dict
-
-
 def load_dgeco(args, device: torch.device) -> torch.nn.Module:
-    args.training = True
-    model = build_model(args).to(device)
+    model_args = argparse.Namespace(**vars(args))
+    model_args.training = True
+    model = build_model(model_args).to(device)
 
     checkpoint_path = args.checkpoint
     if checkpoint_path is None:
@@ -188,7 +180,22 @@ def load_dgeco(args, device: torch.device) -> torch.nn.Module:
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get("model", checkpoint)
-    model.load_state_dict(normalize_checkpoint_keys(state_dict), strict=False)
+    load_model_state_dict(
+        model,
+        state_dict,
+        allow_partial_load=getattr(args, "allow_partial_load", False),
+        logger=print,
+        context=str(checkpoint_path),
+    )
+    checkpoint_meta = {}
+    if isinstance(checkpoint, dict):
+        checkpoint_meta = {
+            key: to_jsonable(value)
+            for key, value in checkpoint.items()
+            if key != "model"
+        }
+    model._dgeco_checkpoint_path = str(checkpoint_path)
+    model._dgeco_checkpoint_meta = checkpoint_meta
     model.eval()
     return model
 
@@ -219,10 +226,13 @@ def postprocess_outputs(
     nms_iou: float,
     min_box_area: float,
     max_box_area: float,
+    nms_method: str = "dense_soft",
+    soft_nms_sigma: float = 0.5,
+    soft_nms_score_threshold: float = 0.001,
     adaptive_sparse_score_ratio: float = 0.50,
-    adaptive_dense_score_ratio: float = 0.45,
+    adaptive_dense_score_ratio: float = 0.35,
     adaptive_sparse_nms_iou: float = 0.25,
-    adaptive_dense_nms_iou: float = 0.25,
+    adaptive_dense_nms_iou: float = 0.45,
     adaptive_dense_candidate_threshold: int = 128,
     exemplar_boxes: Optional[torch.Tensor] = None,
     verification_mode: str = "none",
@@ -245,6 +255,9 @@ def postprocess_outputs(
         pre_nms_topk=pre_nms_topk,
         max_detections=max_detections,
         nms_iou=nms_iou,
+        nms_method=nms_method,
+        soft_nms_sigma=soft_nms_sigma,
+        soft_nms_score_threshold=soft_nms_score_threshold,
         min_box_area=min_box_area,
         max_box_area=max_box_area,
         adaptive_sparse_score_ratio=adaptive_sparse_score_ratio,
@@ -533,7 +546,7 @@ def run_coco_bbox_eval(
     coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
     coco_eval.params.imgIds = sorted({int(image_id) for image_id in image_ids})
     coco_eval.params.catIds = [int(category_id)]
-    coco_eval.params.maxDets = [1, 10, max(10, int(max_dets))]
+    coco_eval.params.maxDets = [1, 10, 100]
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
@@ -553,12 +566,33 @@ def run_coco_bbox_eval(
         "AR_large",
     ]
     metrics = {name: float(value) for name, value in zip(names, coco_eval.stats)}
+    requested_max_dets = max(1, int(max_dets))
+    custom_max_dets = requested_max_dets
+    if custom_max_dets > 100:
+        coco_eval_custom = COCOeval(coco_gt, coco_dt, iouType="bbox")
+        coco_eval_custom.params.imgIds = sorted({int(image_id) for image_id in image_ids})
+        coco_eval_custom.params.catIds = [int(category_id)]
+        coco_eval_custom.params.maxDets = [1, 10, custom_max_dets]
+        coco_eval_custom.evaluate()
+        coco_eval_custom.accumulate()
+        recall = coco_eval_custom.eval.get("recall")
+        area_labels = list(coco_eval_custom.params.areaRngLbl)
+        max_dets_values = list(coco_eval_custom.params.maxDets)
+        area_idx = area_labels.index("all")
+        max_det_idx = max_dets_values.index(custom_max_dets)
+        valid_recall = recall[:, :, area_idx, max_det_idx]
+        valid_recall = valid_recall[valid_recall > -1]
+        ar_custom = -1.0 if valid_recall.size == 0 else float(np.mean(valid_recall))
+        metrics["AR_custom"] = ar_custom
+        metrics[f"AR_{custom_max_dets}"] = ar_custom
     metrics.update(
         {
             "image_count": int(len(set(image_ids))),
             "detection_count": int(len(detections)),
             "category_id": int(category_id),
-            "max_dets": int(max(10, int(max_dets))),
+            "ap_max_dets": 100,
+            "requested_max_dets": requested_max_dets,
+            "custom_max_dets": custom_max_dets if custom_max_dets > 100 else 100,
         }
     )
 
@@ -583,6 +617,8 @@ def run_dataset(args, model: torch.nn.Module, device: torch.device) -> None:
         tiling_p=args.tiling_p,
         zero_shot=args.zero_shot,
         training=False,
+        allow_missing_coco=args.allow_missing_coco,
+        exemplar_scale_mode=args.exemplar_scale_mode,
     )
     if args.split == "train":
         # FSC147DATASET keys augmentation/return shape off split == "train".
@@ -639,6 +675,9 @@ def run_dataset(args, model: torch.nn.Module, device: torch.device) -> None:
                     pre_nms_topk=args.pre_nms_topk,
                     max_detections=args.max_detections,
                     nms_iou=args.nms_iou,
+                    nms_method=args.nms_method,
+                    soft_nms_sigma=args.soft_nms_sigma,
+                    soft_nms_score_threshold=args.soft_nms_score_threshold,
                     min_box_area=args.min_box_area,
                     max_box_area=args.max_box_area,
                     adaptive_sparse_score_ratio=args.adaptive_sparse_score_ratio,
@@ -783,6 +822,7 @@ def run_single_image(args, model: torch.nn.Module, device: torch.device) -> None
         size=args.image_size,
         zero_shot=args.zero_shot,
         train=False,
+        adjust_exemplar_scale=args.exemplar_scale_mode != "never",
     )
     padded_img = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(
         padded_img
@@ -805,6 +845,9 @@ def run_single_image(args, model: torch.nn.Module, device: torch.device) -> None
         pre_nms_topk=args.pre_nms_topk,
         max_detections=args.max_detections,
         nms_iou=args.nms_iou,
+        nms_method=args.nms_method,
+        soft_nms_sigma=args.soft_nms_sigma,
+        soft_nms_score_threshold=args.soft_nms_score_threshold,
         min_box_area=args.min_box_area,
         max_box_area=args.max_box_area,
         adaptive_sparse_score_ratio=args.adaptive_sparse_score_ratio,

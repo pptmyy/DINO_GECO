@@ -1,5 +1,3 @@
-# DINO_GECO
-DINOv3为骨干深度学习网络，解决FSCD147数据集，少标注计数检测问题
 # DINO-SAM-GECO2
 
 DINO-SAM-GECO2 is a research codebase for few-shot object counting and detection on the FSC147 dataset. The model uses a frozen DINOv3 visual backbone to extract dense image features, builds object prototypes from a small set of exemplar boxes, predicts object boxes on a dense grid, and can optionally refine predictions with SAM3 masks.

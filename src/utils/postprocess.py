@@ -26,6 +26,10 @@ class PostprocessStats:
     pre_nms_topk: int
     max_detections: int
     nms_iou: float
+    nms_method: str
+    effective_nms_method: str
+    soft_nms_sigma: float
+    soft_nms_score_threshold: float
     min_box_area: float
     max_box_area: float
     adaptive_regime: str
@@ -60,6 +64,10 @@ def _empty_stats(
     nms_iou: float,
     min_box_area: float,
     max_box_area: float,
+    nms_method: str = "hard",
+    effective_nms_method: str = "hard",
+    soft_nms_sigma: float = 0.5,
+    soft_nms_score_threshold: float = 0.001,
     adaptive_regime: str = "none",
     adaptive_candidate_count: int = 0,
     effective_score_ratio: float = 0.0,
@@ -89,6 +97,10 @@ def _empty_stats(
         pre_nms_topk=int(pre_nms_topk),
         max_detections=int(max_detections),
         nms_iou=float(nms_iou),
+        nms_method=str(nms_method),
+        effective_nms_method=str(effective_nms_method),
+        soft_nms_sigma=float(soft_nms_sigma),
+        soft_nms_score_threshold=float(soft_nms_score_threshold),
         min_box_area=float(min_box_area),
         max_box_area=float(max_box_area),
         adaptive_regime=str(adaptive_regime),
@@ -144,17 +156,6 @@ def _threshold_plan(
     adaptive_dense_nms_iou: float,
     adaptive_dense_candidate_threshold: int,
 ) -> Tuple[torch.Tensor, float, str, int, float]:
-    if threshold_mode != "regime_adaptive":
-        threshold = _effective_threshold(
-            scores,
-            threshold_mode=threshold_mode,
-            score_threshold=score_threshold,
-            score_ratio=score_ratio,
-            score_quantile=score_quantile,
-            min_score_gap=min_score_gap,
-        )
-        return threshold, float(nms_iou), "none", 0, float(score_ratio)
-
     base_threshold = _effective_threshold(
         scores,
         threshold_mode="static_ratio",
@@ -166,22 +167,75 @@ def _threshold_plan(
     candidate_count = int((scores >= base_threshold).sum().item())
     if candidate_count >= int(adaptive_dense_candidate_threshold):
         regime = "dense"
-        effective_score_ratio = float(adaptive_dense_score_ratio)
-        effective_nms_iou = float(adaptive_dense_nms_iou)
+        adaptive_nms_iou = float(adaptive_dense_nms_iou)
+        adaptive_score_ratio = float(adaptive_dense_score_ratio)
     else:
         regime = "sparse"
-        effective_score_ratio = float(adaptive_sparse_score_ratio)
-        effective_nms_iou = float(adaptive_sparse_nms_iou)
+        adaptive_nms_iou = float(adaptive_sparse_nms_iou)
+        adaptive_score_ratio = float(adaptive_sparse_score_ratio)
+
+    if threshold_mode != "regime_adaptive":
+        threshold = _effective_threshold(
+            scores,
+            threshold_mode=threshold_mode,
+            score_threshold=score_threshold,
+            score_ratio=score_ratio,
+            score_quantile=score_quantile,
+            min_score_gap=min_score_gap,
+        )
+        return threshold, adaptive_nms_iou, regime, candidate_count, float(score_ratio)
 
     threshold = _effective_threshold(
         scores,
         threshold_mode="static_ratio",
         score_threshold=score_threshold,
-        score_ratio=effective_score_ratio,
+        score_ratio=adaptive_score_ratio,
         score_quantile=score_quantile,
         min_score_gap=min_score_gap,
     )
-    return threshold, effective_nms_iou, regime, candidate_count, effective_score_ratio
+    return threshold, adaptive_nms_iou, regime, candidate_count, adaptive_score_ratio
+
+
+def _soft_nms(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    iou_threshold: float,
+    sigma: float,
+    score_threshold: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if boxes.numel() == 0 or scores.numel() == 0:
+        empty = torch.empty(0, dtype=torch.long, device=boxes.device)
+        return empty, scores
+
+    remaining = torch.arange(scores.numel(), dtype=torch.long, device=scores.device)
+    updated_scores = scores.clone()
+    keep = []
+    sigma = max(float(sigma), torch.finfo(scores.dtype).eps)
+    score_threshold = float(score_threshold)
+
+    while remaining.numel() > 0:
+        local_scores = updated_scores[remaining]
+        best_local = torch.argmax(local_scores)
+        best_idx = remaining[best_local]
+        if float(updated_scores[best_idx].item()) < score_threshold:
+            break
+
+        keep.append(best_idx)
+        remaining = remaining[remaining != best_idx]
+        if remaining.numel() == 0:
+            break
+
+        ious = ops.box_iou(boxes[best_idx].unsqueeze(0), boxes[remaining]).squeeze(0)
+        decay = torch.ones_like(ious)
+        overlap = ious > float(iou_threshold)
+        decay[overlap] = torch.exp(-((ious[overlap] * ious[overlap]) / sigma))
+        updated_scores[remaining] = updated_scores[remaining] * decay
+        remaining = remaining[updated_scores[remaining] >= score_threshold]
+
+    if not keep:
+        return torch.empty(0, dtype=torch.long, device=boxes.device), updated_scores
+    return torch.stack(keep).to(dtype=torch.long), updated_scores
 
 
 def filter_detections(
@@ -192,15 +246,18 @@ def filter_detections(
     threshold_mode: str = "static_ratio",
     score_quantile: float = 0.98,
     min_score_gap: float = 0.0,
-    pre_nms_topk: int = 4096,
-    max_detections: int = 4096,
+    pre_nms_topk: int = 16000,
+    max_detections: int = 16000,
     nms_iou: float = 0.30,
+    nms_method: str = "dense_soft",
+    soft_nms_sigma: float = 0.5,
+    soft_nms_score_threshold: float = 0.001,
     min_box_area: float = 0.0,
     max_box_area: float = 0.0,
     adaptive_sparse_score_ratio: float = 0.50,
-    adaptive_dense_score_ratio: float = 0.45,
+    adaptive_dense_score_ratio: float = 0.35,
     adaptive_sparse_nms_iou: float = 0.25,
-    adaptive_dense_nms_iou: float = 0.25,
+    adaptive_dense_nms_iou: float = 0.45,
     adaptive_dense_candidate_threshold: int = 128,
     return_stats: bool = False,
     return_indices: bool = False,
@@ -211,6 +268,9 @@ def filter_detections(
     Tuple[torch.Tensor, torch.Tensor, PostprocessStats, torch.Tensor],
 ]:
     """Filter point-generated boxes with configurable thresholding and NMS."""
+    if nms_method not in {"hard", "soft", "dense_soft"}:
+        raise ValueError(f"Unsupported nms_method: {nms_method!r}")
+
     def make_result(
         boxes_out: torch.Tensor,
         scores_out: torch.Tensor,
@@ -246,6 +306,10 @@ def filter_detections(
             pre_nms_topk=pre_nms_topk,
             max_detections=max_detections,
             nms_iou=nms_iou,
+            nms_method=nms_method,
+            effective_nms_method="hard" if nms_method == "dense_soft" else nms_method,
+            soft_nms_sigma=soft_nms_sigma,
+            soft_nms_score_threshold=soft_nms_score_threshold,
             min_box_area=min_box_area,
             max_box_area=max_box_area,
             effective_score_ratio=score_ratio,
@@ -300,6 +364,10 @@ def filter_detections(
             pre_nms_topk=pre_nms_topk,
             max_detections=max_detections,
             nms_iou=nms_iou,
+            nms_method=nms_method,
+            effective_nms_method="hard" if nms_method == "dense_soft" else nms_method,
+            soft_nms_sigma=soft_nms_sigma,
+            soft_nms_score_threshold=soft_nms_score_threshold,
             min_box_area=min_box_area,
             max_box_area=max_box_area,
             adaptive_regime=adaptive_regime,
@@ -335,6 +403,10 @@ def filter_detections(
             pre_nms_topk=pre_nms_topk,
             max_detections=max_detections,
             nms_iou=nms_iou,
+            nms_method=nms_method,
+            effective_nms_method="hard" if nms_method == "dense_soft" else nms_method,
+            soft_nms_sigma=soft_nms_sigma,
+            soft_nms_score_threshold=soft_nms_score_threshold,
             min_box_area=min_box_area,
             max_box_area=max_box_area,
             adaptive_regime=adaptive_regime,
@@ -376,6 +448,10 @@ def filter_detections(
             pre_nms_topk=pre_nms_topk,
             max_detections=max_detections,
             nms_iou=nms_iou,
+            nms_method=nms_method,
+            effective_nms_method="hard" if nms_method == "dense_soft" else nms_method,
+            soft_nms_sigma=soft_nms_sigma,
+            soft_nms_score_threshold=soft_nms_score_threshold,
             min_box_area=min_box_area,
             max_box_area=max_box_area,
             adaptive_regime=adaptive_regime,
@@ -396,7 +472,20 @@ def filter_detections(
         original_indices = original_indices[topk_idx]
 
     preds_before_nms = int(scores.numel())
-    keep = ops.nms(boxes, scores, float(effective_nms_iou))
+    effective_nms_method = nms_method
+    if nms_method == "dense_soft":
+        effective_nms_method = "soft" if adaptive_regime == "dense" else "hard"
+
+    if effective_nms_method == "soft":
+        keep, scores = _soft_nms(
+            boxes,
+            scores,
+            iou_threshold=float(effective_nms_iou),
+            sigma=float(soft_nms_sigma),
+            score_threshold=float(soft_nms_score_threshold),
+        )
+    else:
+        keep = ops.nms(boxes, scores, float(effective_nms_iou))
     if max_detections > 0:
         keep = keep[: int(max_detections)]
 
@@ -424,6 +513,10 @@ def filter_detections(
         pre_nms_topk=pre_nms_topk,
         max_detections=max_detections,
         nms_iou=nms_iou,
+        nms_method=nms_method,
+        effective_nms_method=effective_nms_method,
+        soft_nms_sigma=soft_nms_sigma,
+        soft_nms_score_threshold=soft_nms_score_threshold,
         min_box_area=min_box_area,
         max_box_area=max_box_area,
         adaptive_regime=adaptive_regime,

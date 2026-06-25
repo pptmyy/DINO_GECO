@@ -24,6 +24,12 @@ from infer import (
     postprocess_outputs,
 )
 from src.datasets.data import FSC147DATASET, pad_collate_test
+from src.utils.detection_metrics import (
+    average_precision_from_records,
+    detection_ap_records,
+    detection_summary,
+    greedy_detection_counts,
+)
 from tools.diagnostics import SplitSummary, write_csv, write_json
 
 
@@ -37,6 +43,14 @@ def parse_int_list(value: str) -> List[int]:
 
 def parse_str_list(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def valid_gt_boxes_norm(gt_bboxes_i: torch.Tensor, image_size: int) -> torch.Tensor:
+    if gt_bboxes_i.numel() == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    gt_bboxes_i = gt_bboxes_i.reshape(-1, 4).float()
+    valid_mask = torch.logical_not((gt_bboxes_i == 0).all(dim=1))
+    return gt_bboxes_i[valid_mask] / float(image_size)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--score-thresholds", default=None, type=str)
     parser.add_argument("--score-ratios", default=None, type=str)
     parser.add_argument("--nms-ious", default=None, type=str)
+    parser.add_argument("--nms-methods", default=None, type=str)
+    parser.add_argument("--soft-nms-sigmas", default=None, type=str)
+    parser.add_argument("--soft-nms-score-thresholds", default=None, type=str)
     parser.add_argument("--threshold-modes", default=None, type=str)
     parser.add_argument("--score-quantiles", default=None, type=str)
     parser.add_argument("--verification-modes", default=None, type=str)
@@ -95,6 +112,8 @@ def make_dataset(args):
         tiling_p=args.tiling_p,
         zero_shot=args.zero_shot,
         training=False,
+        allow_missing_coco=args.allow_missing_coco,
+        exemplar_scale_mode=args.exemplar_scale_mode,
     )
     if args.split == "train":
         dataset.split = "test"
@@ -113,6 +132,21 @@ def build_combinations(args) -> List[Dict[str, object]]:
         else [float(args.score_ratio)]
     )
     nms_ious = parse_float_list(args.nms_ious) if args.nms_ious else [float(args.nms_iou)]
+    nms_methods = (
+        parse_str_list(args.nms_methods)
+        if args.nms_methods
+        else [str(args.nms_method)]
+    )
+    soft_nms_sigmas = (
+        parse_float_list(args.soft_nms_sigmas)
+        if args.soft_nms_sigmas
+        else [float(args.soft_nms_sigma)]
+    )
+    soft_nms_score_thresholds = (
+        parse_float_list(args.soft_nms_score_thresholds)
+        if args.soft_nms_score_thresholds
+        else [float(args.soft_nms_score_threshold)]
+    )
     threshold_modes = (
         parse_str_list(args.threshold_modes)
         if args.threshold_modes
@@ -220,6 +254,9 @@ def build_combinations(args) -> List[Dict[str, object]]:
                     score_thresholds,
                     score_ratios,
                     nms_ious,
+                    nms_methods,
+                    soft_nms_sigmas,
+                    soft_nms_score_thresholds,
                     quantiles,
                     thresholds,
                     topks,
@@ -231,6 +268,9 @@ def build_combinations(args) -> List[Dict[str, object]]:
                         score_threshold,
                         score_ratio,
                         nms_iou,
+                        nms_method,
+                        soft_nms_sigma,
+                        soft_nms_score_threshold,
                         score_quantile,
                         verification_threshold,
                         verification_topk,
@@ -243,6 +283,9 @@ def build_combinations(args) -> List[Dict[str, object]]:
                             "score_threshold": float(score_threshold),
                             "score_ratio": float(score_ratio),
                             "nms_iou": float(nms_iou),
+                            "nms_method": str(nms_method),
+                            "soft_nms_sigma": float(soft_nms_sigma),
+                            "soft_nms_score_threshold": float(soft_nms_score_threshold),
                             "threshold_mode": threshold_mode,
                             "score_quantile": float(score_quantile),
                             "adaptive_sparse_score_ratio": float(adaptive_sparse_score_ratio),
@@ -364,6 +407,12 @@ def run_sweep(args) -> Dict[str, object]:
 
     summaries = {int(combo["combo_id"]): SplitSummary() for combo in combos}
     records_by_combo = {int(combo["combo_id"]): [] for combo in combos}
+    detection_totals = {
+        int(combo["combo_id"]): {"tp": 0, "fp": 0, "fn": 0}
+        for combo in combos
+    }
+    detection_ap_records_by_combo = {int(combo["combo_id"]): [] for combo in combos}
+    detection_gt_counts = {int(combo["combo_id"]): 0 for combo in combos}
     seen = 0
 
     for batch in loader:
@@ -382,6 +431,7 @@ def run_sweep(args) -> Dict[str, object]:
                 original_size = pil_image.size
 
             gt_count = count_valid_gt_boxes(gt_bboxes[idx])
+            target_boxes_norm = valid_gt_boxes_norm(gt_bboxes[idx], args.image_size)
             density_sum_debug = float(density_map[idx].sum().item())
             exemplar_boxes = bboxes[idx] / float(args.image_size)
 
@@ -396,6 +446,9 @@ def run_sweep(args) -> Dict[str, object]:
                     pre_nms_topk=args.pre_nms_topk,
                     max_detections=args.max_detections,
                     nms_iou=float(combo["nms_iou"]),
+                    nms_method=str(combo["nms_method"]),
+                    soft_nms_sigma=float(combo["soft_nms_sigma"]),
+                    soft_nms_score_threshold=float(combo["soft_nms_score_threshold"]),
                     min_box_area=args.min_box_area,
                     max_box_area=args.max_box_area,
                     adaptive_sparse_score_ratio=float(combo["adaptive_sparse_score_ratio"]),
@@ -427,6 +480,25 @@ def run_sweep(args) -> Dict[str, object]:
                 )
                 pred_count = int(boxes_orig.shape[0])
                 combo_id = int(combo["combo_id"])
+                boxes_eval = boxes_norm.detach().cpu()[_keep_original]
+                scores_eval = scores.detach().cpu()[_keep_original]
+                tp, fp, fn = greedy_detection_counts(
+                    boxes_eval,
+                    target_boxes_norm,
+                    iou_threshold=getattr(args, "val_iou_threshold", 0.5),
+                )
+                detection_totals[combo_id]["tp"] += tp
+                detection_totals[combo_id]["fp"] += fp
+                detection_totals[combo_id]["fn"] += fn
+                detection_gt_counts[combo_id] += int(target_boxes_norm.shape[0])
+                detection_ap_records_by_combo[combo_id].extend(
+                    detection_ap_records(
+                        boxes_eval,
+                        scores_eval,
+                        target_boxes_norm,
+                        iou_threshold=getattr(args, "val_iou_threshold", 0.5),
+                    )
+                )
                 postprocess_dict = postprocess_stats.to_dict()
                 verification_dict = verification_stats.to_dict()
                 summaries[combo_id].update(
@@ -453,6 +525,7 @@ def run_sweep(args) -> Dict[str, object]:
                             ),
                             "effective_nms_iou": postprocess_dict.get("effective_nms_iou"),
                             "adaptive_regime": postprocess_dict.get("adaptive_regime"),
+                            "nms_method": postprocess_dict.get("effective_nms_method"),
                             "verification_score_mean": verification_dict.get(
                                 "verification_score_mean"
                             ),
@@ -470,9 +543,24 @@ def run_sweep(args) -> Dict[str, object]:
         if args.max_images is not None and seen >= args.max_images:
             break
 
-    sweep_rows = [
-        combo_row(combo, summaries[int(combo["combo_id"])], args.split) for combo in combos
-    ]
+    detection_rows = {
+        combo_id: detection_summary(
+            totals["tp"],
+            totals["fp"],
+            totals["fn"],
+            ap50=average_precision_from_records(
+                detection_ap_records_by_combo[combo_id],
+                detection_gt_counts[combo_id],
+            ),
+        )
+        for combo_id, totals in detection_totals.items()
+    }
+    sweep_rows = []
+    for combo in combos:
+        combo_id = int(combo["combo_id"])
+        row = combo_row(combo, summaries[combo_id], args.split)
+        row.update(detection_rows[combo_id])
+        sweep_rows.append(row)
     sweep_rows.sort(key=lambda row: (float(row["mae"]), float(row["rmse"])))
     count_bin_rows: List[Dict[str, object]] = []
     for combo in combos:
@@ -486,6 +574,26 @@ def run_sweep(args) -> Dict[str, object]:
             top_error_rows(combos, records_by_combo, args.top_k_errors),
         )
     best_by_rmse = min(sweep_rows, key=lambda row: float(row["rmse"])) if sweep_rows else None
+    best_detection_f1 = max(
+        (float(row["f1_iou50"]) for row in sweep_rows),
+        default=0.0,
+    )
+    best_detection_ap50 = max(
+        (float(row["ap50"]) for row in sweep_rows),
+        default=0.0,
+    )
+    gate_threshold = best_detection_f1 * float(getattr(args, "detection_gate_ratio", 0.98))
+    ap50_gate_threshold = best_detection_ap50 * float(getattr(args, "detection_gate_ratio", 0.98))
+    gated_rows = [
+        row
+        for row in sweep_rows
+        if float(row["f1_iou50"]) >= gate_threshold
+        and float(row["ap50"]) >= ap50_gate_threshold
+    ]
+    best_gated_by_mae = gated_rows[0] if gated_rows else None
+    best_gated_by_rmse = (
+        min(gated_rows, key=lambda row: float(row["rmse"])) if gated_rows else None
+    )
     result = {
         "split": args.split,
         "checkpoint": args.checkpoint or str(Path(args.model_path) / f"{args.model_name}.pth"),
@@ -493,9 +601,65 @@ def run_sweep(args) -> Dict[str, object]:
         "combination_count": len(combos),
         "best_by_mae": sweep_rows[0] if sweep_rows else None,
         "best_by_rmse": best_by_rmse,
+        "best_detection_f1_iou50": best_detection_f1,
+        "best_detection_ap50": best_detection_ap50,
+        "detection_gate_ratio": float(getattr(args, "detection_gate_ratio", 0.98)),
+        "detection_gate_threshold": gate_threshold,
+        "detection_f1_gate_threshold": gate_threshold,
+        "detection_ap50_gate_threshold": ap50_gate_threshold,
+        "best_gated_by_mae": best_gated_by_mae,
+        "best_gated_by_rmse": best_gated_by_rmse,
         "pareto_front": pareto_front(sweep_rows),
     }
     write_json(output_dir / "summary.json", result)
+    coco_metrics = {
+        "enabled": False,
+        "reason": "postprocess sweep uses internal AP50/F1 records; COCO AP/AP75 was not run",
+        "image_count": int(seen),
+        "checkpoint": result["checkpoint"],
+    }
+    write_json(output_dir / "coco_metrics.json", coco_metrics)
+    write_json(
+        output_dir / "selection_report.json",
+        {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "protocol": "P0",
+            "selection_policy": (
+                "First enforce the detection gate, then compare gated MAE/RMSE and "
+                "count-bin signed error; keep ungated best rows for diagnostics only."
+            ),
+            "split": args.split,
+            "checkpoint": result["checkpoint"],
+            "protocol_config": {
+                "model_name": args.model_name,
+                "query_output_stride": int(getattr(args, "query_output_stride", 4)),
+                "use_semantic_anchor": bool(getattr(args, "use_semantic_anchor", False)),
+                "detection_gate_ratio": float(getattr(args, "detection_gate_ratio", 0.98)),
+                "combination_count": len(combos),
+            },
+            "selected_rows": {
+                "best_by_mae": result["best_by_mae"],
+                "best_by_rmse": result["best_by_rmse"],
+                "best_gated_by_mae": result["best_gated_by_mae"],
+                "best_gated_by_rmse": result["best_gated_by_rmse"],
+            },
+            "detection_gate": {
+                "best_detection_f1_iou50": result["best_detection_f1_iou50"],
+                "best_detection_ap50": result["best_detection_ap50"],
+                "detection_f1_gate_threshold": result["detection_f1_gate_threshold"],
+                "detection_ap50_gate_threshold": result["detection_ap50_gate_threshold"],
+            },
+            "artifacts": {
+                "args": str(output_dir / "args.json"),
+                "summary": str(output_dir / "summary.json"),
+                "summary_by_count_bin": str(output_dir / "summary_by_count_bin.csv"),
+                "postprocess_sweep": str(output_dir / "postprocess_sweep.csv"),
+                "top_abs_errors": str(output_dir / "top_errors_by_combo.csv"),
+                "coco_metrics": str(output_dir / "coco_metrics.json"),
+                "selection_report": str(output_dir / "selection_report.json"),
+            },
+        },
+    )
     return result
 
 

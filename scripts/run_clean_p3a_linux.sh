@@ -6,17 +6,20 @@ cd "$PROJECT_ROOT"
 
 export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/src:$PROJECT_ROOT/src/models/DeformableDETR:${PYTHONPATH:-}"
 
-MODEL_NAME="${MODEL_NAME:-DGECO2FSCD}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+# Clean P3-A: keep the P3 training/postprocess protocol and only enable semantic anchor.
+MODEL_NAME="${MODEL_NAME:-DGECO2FSCD_P3A_CLEAN}"
 DATA_PATH="${DATA_PATH:-$PROJECT_ROOT/data/FSC147_384_V2}"
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/checkpoints}"
+MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/checkpoints/p3a_clean}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs}"
-RUN_NAME="${RUN_NAME:-}"
+RUN_NAME="${RUN_NAME:-p3a_clean_semantic_anchor}"
 
 GPU="${GPU:-0}"
 IMAGE_SIZE="${IMAGE_SIZE:-1024}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-$BATCH_SIZE}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-2}"
 TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-2}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
@@ -42,16 +45,19 @@ SCORE_RATIO="${SCORE_RATIO:-0.50}"
 THRESHOLD_MODE="${THRESHOLD_MODE:-static_ratio}"
 SCORE_QUANTILE="${SCORE_QUANTILE:-0.98}"
 MIN_SCORE_GAP="${MIN_SCORE_GAP:-0.0}"
-PRE_NMS_TOPK="${PRE_NMS_TOPK:-16000}"
-MAX_DETECTIONS="${MAX_DETECTIONS:-16000}"
-NMS_IOU="${NMS_IOU:-0.3}"
+PRE_NMS_TOPK="${PRE_NMS_TOPK:-4096}"
+MAX_DETECTIONS="${MAX_DETECTIONS:-4096}"
+NMS_METHOD="${NMS_METHOD:-hard}"
+NMS_IOU="${NMS_IOU:-0.30}"
 MIN_BOX_AREA="${MIN_BOX_AREA:-0.0}"
 MAX_BOX_AREA="${MAX_BOX_AREA:-0.0}"
 ADAPTIVE_SPARSE_SCORE_RATIO="${ADAPTIVE_SPARSE_SCORE_RATIO:-0.50}"
-ADAPTIVE_DENSE_SCORE_RATIO="${ADAPTIVE_DENSE_SCORE_RATIO:-0.35}"
+ADAPTIVE_DENSE_SCORE_RATIO="${ADAPTIVE_DENSE_SCORE_RATIO:-0.45}"
 ADAPTIVE_SPARSE_NMS_IOU="${ADAPTIVE_SPARSE_NMS_IOU:-0.25}"
-ADAPTIVE_DENSE_NMS_IOU="${ADAPTIVE_DENSE_NMS_IOU:-0.45}"
+ADAPTIVE_DENSE_NMS_IOU="${ADAPTIVE_DENSE_NMS_IOU:-0.25}"
 ADAPTIVE_DENSE_CANDIDATE_THRESHOLD="${ADAPTIVE_DENSE_CANDIDATE_THRESHOLD:-128}"
+
+# Default to stride-4 main detection; stride-2 is used by the refinement branch.
 QUERY_OUTPUT_STRIDE="${QUERY_OUTPUT_STRIDE:-4}"
 STRIDE2_REFINEMENT="${STRIDE2_REFINEMENT:-1}"
 CENTER_GAUSSIAN_HEAD="${CENTER_GAUSSIAN_HEAD:-1}"
@@ -63,7 +69,7 @@ PROTOTYPE_PRED_SCORE_THRESHOLD="${PROTOTYPE_PRED_SCORE_THRESHOLD:-0.5}"
 PROTOTYPE_EMA_MOMENTUM="${PROTOTYPE_EMA_MOMENTUM:-0.9}"
 MUTUAL_ADAPTER_LAYERS="${MUTUAL_ADAPTER_LAYERS:-1}"
 DECOUPLED_HEADS="${DECOUPLED_HEADS:-1}"
-USE_SEMANTIC_ANCHOR="${USE_SEMANTIC_ANCHOR:-0}"
+
 VERIFICATION_MODE="${VERIFICATION_MODE:-none}"
 VERIFICATION_THRESHOLD="${VERIFICATION_THRESHOLD:-0.0}"
 VERIFICATION_TOPK="${VERIFICATION_TOPK:-0}"
@@ -72,14 +78,17 @@ VERIFICATION_MAX_AREA_RATIO="${VERIFICATION_MAX_AREA_RATIO:-0.0}"
 VERIFICATION_FILTER_MODE="${VERIFICATION_FILTER_MODE:-hard}"
 VERIFICATION_SCORE_GAMMA="${VERIFICATION_SCORE_GAMMA:-0.0}"
 VERIFICATION_HARD_CANDIDATE_LIMIT="${VERIFICATION_HARD_CANDIDATE_LIMIT:-0}"
+VAL_IOU_THRESHOLD="${VAL_IOU_THRESHOLD:-0.5}"
+DETECTION_METRIC_INTERVAL="${DETECTION_METRIC_INTERVAL:-1}"
+DETECTION_GATE_RATIO="${DETECTION_GATE_RATIO:-0.98}"
 
-GIOU_LOSS_COEF="${GIOU_LOSS_COEF:-2}"
-BBOX_LOSS_COEF="${BBOX_LOSS_COEF:-1}"
-CE_LOSS_COEF="${CE_LOSS_COEF:-2}"
+BBOX_LOSS_COEF="${BBOX_LOSS_COEF:-1.0}"
+GIOU_LOSS_COEF="${GIOU_LOSS_COEF:-2.0}"
+CE_LOSS_COEF="${CE_LOSS_COEF:-2.0}"
 AUX_LOSS_COEF="${AUX_LOSS_COEF:-0.5}"
-COST_CLASS="${COST_CLASS:-2}"
-COST_BBOX="${COST_BBOX:-1}"
-COST_GIOU="${COST_GIOU:-2}"
+COST_CLASS="${COST_CLASS:-2.0}"
+COST_BBOX="${COST_BBOX:-1.0}"
+COST_GIOU="${COST_GIOU:-2.0}"
 FOCAL_ALPHA="${FOCAL_ALPHA:-0.5}"
 
 MODEL_NAME_RESUME_FROM="${MODEL_NAME_RESUME_FROM:-base_3_shot_softmax1}"
@@ -102,7 +111,7 @@ fi
 mkdir -p "$MODEL_PATH" "$LOG_DIR"
 
 cmd=(
-  python -u train.py
+  "$PYTHON_BIN" -u train.py
   --model_name "$MODEL_NAME"
   --data_path "$DATA_PATH"
   --dataset fsc147
@@ -110,8 +119,11 @@ cmd=(
   --batch_size "$BATCH_SIZE"
   --grad_accum_steps "$GRAD_ACCUM_STEPS"
   --eval_batch_size "$EVAL_BATCH_SIZE"
+  --val_batch_size "$VAL_BATCH_SIZE"
+  --test_batch_size "$TEST_BATCH_SIZE"
   --num_workers "$NUM_WORKERS"
   --log_dir "$LOG_DIR"
+  --run_name "$RUN_NAME"
   --log_interval "$LOG_INTERVAL"
   --model_path "$MODEL_PATH"
   --gpu "$GPU"
@@ -123,6 +135,7 @@ cmd=(
   --min-score-gap "$MIN_SCORE_GAP"
   --pre-nms-topk "$PRE_NMS_TOPK"
   --max-detections "$MAX_DETECTIONS"
+  --nms-method "$NMS_METHOD"
   --nms-iou "$NMS_IOU"
   --min-box-area "$MIN_BOX_AREA"
   --max-box-area "$MAX_BOX_AREA"
@@ -139,6 +152,7 @@ cmd=(
   --prototype-pred-score-threshold "$PROTOTYPE_PRED_SCORE_THRESHOLD"
   --prototype-ema-momentum "$PROTOTYPE_EMA_MOMENTUM"
   --mutual-adapter-layers "$MUTUAL_ADAPTER_LAYERS"
+  --use-semantic-anchor
   --verification-mode "$VERIFICATION_MODE"
   --verification-threshold "$VERIFICATION_THRESHOLD"
   --verification-topk "$VERIFICATION_TOPK"
@@ -147,6 +161,9 @@ cmd=(
   --verification-filter-mode "$VERIFICATION_FILTER_MODE"
   --verification-score-gamma "$VERIFICATION_SCORE_GAMMA"
   --verification-hard-candidate-limit "$VERIFICATION_HARD_CANDIDATE_LIMIT"
+  --val-iou-threshold "$VAL_IOU_THRESHOLD"
+  --detection-metric-interval "$DETECTION_METRIC_INTERVAL"
+  --detection-gate-ratio "$DETECTION_GATE_RATIO"
   --dinov3_model_size "$DINOV3_MODEL_SIZE"
   --dinov3_pretrained_weights "$DINOV3_WEIGHTS"
   --backbone "$BACKBONE"
@@ -170,28 +187,12 @@ cmd=(
   --model_name_resume_from "$MODEL_NAME_RESUME_FROM"
 )
 
-if [[ -n "$RUN_NAME" ]]; then
-  cmd+=(--run_name "$RUN_NAME")
-fi
-
-if [[ -n "$VAL_BATCH_SIZE" ]]; then
-  cmd+=(--val_batch_size "$VAL_BATCH_SIZE")
-fi
-
-if [[ -n "$TEST_BATCH_SIZE" ]]; then
-  cmd+=(--test_batch_size "$TEST_BATCH_SIZE")
-fi
-
 if [[ "$RESUME_TRAINING" == "1" ]]; then
   cmd+=(--resume_training)
 fi
 
 if [[ "$ZERO_SHOT" == "1" ]]; then
   cmd+=(--zero_shot)
-fi
-
-if [[ "$USE_SEMANTIC_ANCHOR" == "1" ]]; then
-  cmd+=(--use-semantic-anchor)
 fi
 
 if [[ "$STRIDE2_REFINEMENT" != "1" ]]; then
@@ -217,6 +218,24 @@ fi
 if [[ -n "$MAX_TEST_BATCHES" ]]; then
   cmd+=(--max_test_batches "$MAX_TEST_BATCHES")
 fi
+
+cat <<EOF
+Clean P3-A semantic-anchor experiment
+  model_name:          $MODEL_NAME
+  model_path:          $MODEL_PATH
+  log_dir:             $LOG_DIR
+  data_path:           $DATA_PATH
+  use_semantic_anchor: true
+  query_output_stride: $QUERY_OUTPUT_STRIDE
+  stride2_refinement:  $STRIDE2_REFINEMENT
+  center_loss_coef:    $CENTER_GAUSSIAN_LOSS_COEF
+  num_prototypes:      $NUM_PROTOTYPES
+  pre_nms_topk:        $PRE_NMS_TOPK
+  max_detections:      $MAX_DETECTIONS
+  nms_method:          $NMS_METHOD
+  nms_iou:             $NMS_IOU
+  verification_mode:   $VERIFICATION_MODE
+EOF
 
 printf 'Running:'
 printf ' %q' "${cmd[@]}" "$@"

@@ -26,6 +26,8 @@ from torch.nn import functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_ROOT = PROJECT_ROOT / "src"
+TEST_IMAGE_SIZE = 128
+TEST_EMB_DIM = 32
 
 # 让 Python 可以 import src.models.DGECO
 if str(PROJECT_ROOT) not in sys.path:
@@ -57,34 +59,32 @@ class FakeDINOv3Adapter(nn.Module):
 
         # DGECO.__init__ 中会读取：
         # self.dinov3_adapter.dinov3.embed_dim
-        self.dinov3 = SimpleNamespace(embed_dim=32)
+        self.dinov3 = SimpleNamespace(embed_dim=TEST_EMB_DIM)
 
-    def forward(self, x):
+    def forward(self, x, bboxes=None):
         bs = x.shape[0]
         device = x.device
         dtype = x.dtype
         c = self.dinov3.embed_dim
 
-        # 主特征 src: [B, C, 64, 64]
-        # DGECO.forward() 中会计算 self.reduction = 1024 / w
-        # 当 w=64 时，reduction=16。
-        src = torch.randn(bs, c, 64, 64, device=device, dtype=dtype)
+        src_h = TEST_IMAGE_SIZE // 16
+        l2_h = TEST_IMAGE_SIZE // 8
+        l1_h = TEST_IMAGE_SIZE // 4
+        src = torch.randn(bs, c, src_h, src_h, device=device, dtype=dtype)
 
-        # 高分辨率特征：
-        # l1 对应原图下采样 4 倍 -> 256x256
-        # l2 对应原图下采样 8 倍 -> 128x128
-        l1 = torch.randn(bs, c, 256, 256, device=device, dtype=dtype)
-        l2 = torch.randn(bs, c, 128, 128, device=device, dtype=dtype)
+        l1 = torch.randn(bs, c, l1_h, l1_h, device=device, dtype=dtype)
+        l2 = torch.randn(bs, c, l2_h, l2_h, device=device, dtype=dtype)
         l3 = src
 
-        pos_l1 = torch.randn(bs, c, 256, 256, device=device, dtype=dtype)
-        pos_l2 = torch.randn(bs, c, 128, 128, device=device, dtype=dtype)
-        pos_l3 = torch.randn(bs, c, 64, 64, device=device, dtype=dtype)
+        pos_l1 = torch.randn(bs, c, l1_h, l1_h, device=device, dtype=dtype)
+        pos_l2 = torch.randn(bs, c, l2_h, l2_h, device=device, dtype=dtype)
+        pos_l3 = torch.randn(bs, c, src_h, src_h, device=device, dtype=dtype)
 
         return {
             "vision_features": src,
             "backbone_fpn": [l1, l2, l3],
             "vision_pos_enc": [pos_l1, pos_l2, pos_l3],
+            "semantic_anchor": torch.randn(bs, c, device=device, dtype=dtype),
         }
 
 
@@ -140,6 +140,8 @@ class FakeQueryGenerator(nn.Module):
         hq_features,
         hq_prototypes,
         hq_pos,
+        semantic_context=None,
+        prototype_memory=None,
     ):
         bs, c, h, w = image_embeddings.shape
 
@@ -162,9 +164,12 @@ class FakeQueryGenerator(nn.Module):
 
         assert isinstance(hq_pos, list)
         assert len(hq_pos) >= 2
+        if prototype_memory is not None:
+            assert prototype_memory.shape[0] == bs
+            assert prototype_memory.shape[-1] == c
 
-        adapted_f = image_embeddings
-        adapted_f_aux = image_embeddings.clone()
+        adapted_f = hq_features[0]
+        adapted_f_aux = F.interpolate(hq_features[0], scale_factor=2, mode="bilinear", align_corners=False)
 
         return adapted_f, adapted_f_aux
 
@@ -261,7 +266,7 @@ def dgeco_mod(monkeypatch):
 
 def build_test_model(dgeco_module, training=True, zero_shot=False):
     return dgeco_module.DGECO(
-        image_size=1024,
+        image_size=TEST_IMAGE_SIZE,
         dinov3_model_size="base",
         dinov3_patch_size=16,
         dinov3_out_feature_indexes=(2, 5, 8, 11),
@@ -273,16 +278,22 @@ def build_test_model(dgeco_module, training=True, zero_shot=False):
         zero_shot=zero_shot,
         training=training,
         reduction=16,
+        query_output_stride=4,
+        stride2_refinement=True,
+        center_gaussian_head=True,
+        num_prototypes=4,
+        mutual_adapter_layers=1,
+        decoupled_heads=True,
     )
 
 
 def make_valid_inputs(bs=2):
-    x = torch.randn(bs, 3, 1024, 1024)
+    x = torch.randn(bs, 3, TEST_IMAGE_SIZE, TEST_IMAGE_SIZE)
 
     bboxes = torch.tensor(
         [
-            [[100.0, 100.0, 220.0, 240.0], [300.0, 300.0, 450.0, 500.0]],
-            [[120.0, 130.0, 260.0, 280.0], [500.0, 520.0, 700.0, 760.0]],
+            [[10.0, 10.0, 30.0, 32.0], [50.0, 48.0, 78.0, 82.0]],
+            [[12.0, 14.0, 34.0, 36.0], [70.0, 72.0, 105.0, 110.0]],
         ],
         dtype=torch.float32,
     )
@@ -331,7 +342,7 @@ def test_dgeco_init_success(dgeco_mod):
     assert hasattr(model, "adapt_features")
 
     assert model.emb_dim == 32
-    assert model.image_size == 1024
+    assert model.image_size == TEST_IMAGE_SIZE
     assert model.reduction == 16
     assert model.num_objects == 2
     assert model.pretrain is False
@@ -370,25 +381,25 @@ def test_dgeco_forward_train_smoke(dgeco_mod):
     assert len(outputs) == bs
     assert ref_points.shape == (bs, 1, 2)
 
-    # FakeQueryGenerator 返回 adapted_f = [B, C, 64, 64]
-    assert centerness.shape == (bs, 1, 64, 64)
-    assert outputs_coord.shape == (bs, 4, 64, 64)
+    assert centerness.shape == (bs, 1, TEST_IMAGE_SIZE // 4, TEST_IMAGE_SIZE // 4)
+    assert outputs_coord.shape == (bs, 4, TEST_IMAGE_SIZE // 4, TEST_IMAGE_SIZE // 4)
 
     assert torch.isfinite(centerness).all()
     assert torch.isfinite(outputs_coord).all()
 
-    (
-        outputs_aux,
-        ref_points_aux,
-        centerness_aux,
-        outputs_coord_aux,
-    ) = aux
+    assert isinstance(aux, dict)
+    outputs_aux = aux["refine_outputs"]
+    ref_points_aux = aux["refine_ref_points"]
+    centerness_aux = aux["refine_centerness"]
+    outputs_coord_aux = aux["refine_boxes"]
+    center_heatmap = aux["center_heatmap"]
 
     assert isinstance(outputs_aux, list)
     assert len(outputs_aux) == bs
     assert ref_points_aux.shape == (bs, 1, 2)
-    assert centerness_aux.shape == centerness.shape
-    assert outputs_coord_aux.shape == outputs_coord.shape
+    assert centerness_aux.shape == (bs, 1, TEST_IMAGE_SIZE // 2, TEST_IMAGE_SIZE // 2)
+    assert outputs_coord_aux.shape == (bs, 4, TEST_IMAGE_SIZE // 2, TEST_IMAGE_SIZE // 2)
+    assert center_heatmap.shape == (bs, 1, TEST_IMAGE_SIZE // 2, TEST_IMAGE_SIZE // 2)
 
     for item in outputs:
         assert "boxes" in item
@@ -413,8 +424,8 @@ def test_dgeco_forward_zero_shot_uses_self_num_objects(dgeco_mod):
 
     assert len(outputs) == 2
     assert ref_points.shape == (2, 1, 2)
-    assert centerness.shape == (2, 1, 64, 64)
-    assert outputs_coord.shape == (2, 4, 64, 64)
+    assert centerness.shape == (2, 1, TEST_IMAGE_SIZE // 4, TEST_IMAGE_SIZE // 4)
+    assert outputs_coord.shape == (2, 4, TEST_IMAGE_SIZE // 4, TEST_IMAGE_SIZE // 4)
 
 
 def test_dgeco_forward_exports_verification_features_when_enabled(dgeco_mod):
@@ -446,15 +457,42 @@ def test_dgeco_forward_bad_bbox_shape_should_fail(dgeco_mod):
     model = build_test_model(dgeco_mod, training=True)
     model.train()
 
-    x = torch.randn(2, 3, 1024, 1024)
+    x = torch.randn(2, 3, TEST_IMAGE_SIZE, TEST_IMAGE_SIZE)
 
     bad_bboxes = torch.tensor(
         [
-            [100.0, 100.0, 220.0, 240.0],
-            [120.0, 130.0, 260.0, 280.0],
+            [10.0, 10.0, 30.0, 32.0],
+            [12.0, 14.0, 34.0, 36.0],
         ],
         dtype=torch.float32,
     )
 
     with pytest.raises(Exception):
         _ = model(x, bad_bboxes)
+
+
+def test_center_gaussian_loss_uses_heatmap_resolution():
+    from src.utils.losses import SetCriterion
+
+    criterion = SetCriterion(
+        0,
+        matcher=None,
+        weight_dict={"loss_center_gaussian": 1.0},
+        losses=[],
+        center_gaussian_sigma=2.0,
+    )
+    heatmap = torch.zeros(1, TEST_IMAGE_SIZE // 2, TEST_IMAGE_SIZE // 2, requires_grad=True)
+    targets = [
+        {
+            "boxes": torch.tensor([[0.25, 0.25, 0.50, 0.50]], dtype=torch.float32),
+            "labels": torch.zeros(1, dtype=torch.long),
+        }
+    ]
+
+    losses = criterion.center_gaussian_loss(targets, heatmap)
+
+    assert torch.isfinite(losses["loss_center_gaussian"])
+    assert losses["center_gaussian_positive_sum"].item() > 0
+    losses["loss_center_gaussian"].backward()
+    assert heatmap.grad is not None
+    assert torch.isfinite(heatmap.grad).all()

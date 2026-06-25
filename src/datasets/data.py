@@ -315,6 +315,7 @@ def resize_and_pad(
     size: int = 1024,
     zero_shot: bool = False,
     train: bool = False,
+    adjust_exemplar_scale: Optional[bool] = None,
     density_output_size: int = 512,
 ):
     """Resize image by aspect ratio, pad to square, and transform boxes/maps."""
@@ -327,7 +328,10 @@ def resize_and_pad(
     bboxes = _sanitize_xyxy_boxes(bboxes)
     gt_bboxes = _sanitize_xyxy_boxes(gt_bboxes) if gt_bboxes is not None else None
 
-    if not zero_shot and not train and bboxes.numel() > 0:
+    if adjust_exemplar_scale is None:
+        adjust_exemplar_scale = not train
+
+    if not zero_shot and adjust_exemplar_scale and bboxes.numel() > 0:
         scaled_bboxes = bboxes * scaling_factor
 
         widths = scaled_bboxes[:, 2] - scaled_bboxes[:, 0]
@@ -474,10 +478,16 @@ class FSC147DATASET(Dataset):
         annotation_file: str = "annotation_FSC147_384.json",
         coco_instances_file: Optional[str] = None,
         density_output_size: int = 512,
-        allow_missing_coco: bool = True,
+        allow_missing_coco: bool = False,
+        exemplar_scale_mode: str = "always",
     ):
         if split not in {"train", "val", "test"}:
             raise ValueError(f"split must be 'train', 'val', or 'test', got {split!r}")
+        if exemplar_scale_mode not in {"always", "eval_only", "never"}:
+            raise ValueError(
+                "exemplar_scale_mode must be 'always', 'eval_only', or 'never', "
+                f"got {exemplar_scale_mode!r}"
+            )
 
         self.split = split
         self.data_path = data_path
@@ -493,6 +503,7 @@ class FSC147DATASET(Dataset):
         self.density_map_dir = self._resolve_density_map_dir(density_map_dir)
         self.density_output_size = int(density_output_size)
         self.allow_missing_coco = bool(allow_missing_coco)
+        self.exemplar_scale_mode = str(exemplar_scale_mode)
 
         self.resize = T.Resize((self.img_size, self.img_size), antialias=True)
         self.jitter = T.RandomApply(
@@ -584,6 +595,13 @@ class FSC147DATASET(Dataset):
             map_name_2_id[img_name] = img_id
 
         return map_name_2_id
+
+    def _should_adjust_exemplar_scale(self) -> bool:
+        if self.exemplar_scale_mode == "always":
+            return True
+        if self.exemplar_scale_mode == "eval_only":
+            return self.split != "train"
+        return False
 
     def get_gt_bboxes(self, idx: int) -> torch.Tensor:
         """Read all GT bboxes for an image from COCO instances file if available."""
@@ -713,6 +731,7 @@ class FSC147DATASET(Dataset):
                     size=self.img_size,
                     zero_shot=self.zero_shot,
                     train=True,
+                    adjust_exemplar_scale=self._should_adjust_exemplar_scale(),
                     density_output_size=self.density_output_size,
                 )
 
@@ -745,6 +764,7 @@ class FSC147DATASET(Dataset):
                 size=self.img_size,
                 zero_shot=self.zero_shot,
                 train=False,
+                adjust_exemplar_scale=self._should_adjust_exemplar_scale(),
                 density_output_size=self.density_output_size,
             )
 
@@ -824,9 +844,21 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=0,
     )
     parser.add_argument(
+        "--allow-missing-coco",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Continue with empty gt_bboxes if instances_{split}.json is missing.",
+    )
+    parser.add_argument(
         "--no-missing-coco",
-        action="store_true",
-        help="Raise error if instances_{split}.json is missing.",
+        action="store_false",
+        dest="allow_missing_coco",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--exemplar-scale-mode",
+        default="always",
+        choices=["always", "eval_only", "never"],
     )
 
     return parser
@@ -843,7 +875,8 @@ def main():
         density_map_dir=args.density_map_dir,
         image_dir=args.image_dir,
         annotations_dir=args.annotations_dir,
-        allow_missing_coco=not args.no_missing_coco,
+        allow_missing_coco=args.allow_missing_coco,
+        exemplar_scale_mode=args.exemplar_scale_mode,
         training=(args.split == "train"),
     )
 
