@@ -1,5 +1,5 @@
 from contextlib import nullcontext
-from typing import List,Dict
+from typing import List, Dict
 
 import torch
 import torch.nn as nn
@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from .dinov3.vision_transformer import DinoVisionTransformer
 from src.models.position_encoding import PositionEmbeddingSine
+from src.models.transformer import Attention
 
 
 def _make_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
@@ -71,6 +72,89 @@ class SpatialPriorModulev2(nn.Module):
         return c1, c2, c3, c4
 
 
+class MutualAwareTokenAdapter(nn.Module):
+    """Bidirectional image/exemplar interaction before ViT tokens become FPN maps."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+    ) -> None:
+        super().__init__()
+        self.image_to_proto = Attention(embed_dim, num_heads)
+        self.proto_to_image = Attention(embed_dim, num_heads)
+        self.image_norm = nn.LayerNorm(embed_dim)
+        self.proto_norm = nn.LayerNorm(embed_dim)
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+
+    @staticmethod
+    def _box_tokens(
+        patch_tokens: torch.Tensor,
+        bboxes: torch.Tensor | None,
+        grid_h: int,
+        grid_w: int,
+        image_h: int,
+        image_w: int,
+    ) -> torch.Tensor:
+        bsz, _, channels = patch_tokens.shape
+        if bboxes is None or bboxes.numel() == 0:
+            return patch_tokens.mean(dim=1, keepdim=True)
+
+        token_map = patch_tokens.reshape(bsz, grid_h, grid_w, channels)
+        bboxes = bboxes.to(device=patch_tokens.device, dtype=patch_tokens.dtype)
+        tokens_per_batch = []
+        for batch_idx in range(bsz):
+            sample_tokens = []
+            for box in bboxes[batch_idx]:
+                if bool((box <= 0).all()):
+                    sample_tokens.append(token_map[batch_idx].reshape(-1, channels).mean(dim=0))
+                    continue
+                x1, y1, x2, y2 = box
+                ix1 = int(torch.floor(x1 * grid_w / max(float(image_w), 1.0)).item())
+                ix2 = int(torch.ceil(x2 * grid_w / max(float(image_w), 1.0)).item())
+                iy1 = int(torch.floor(y1 * grid_h / max(float(image_h), 1.0)).item())
+                iy2 = int(torch.ceil(y2 * grid_h / max(float(image_h), 1.0)).item())
+                ix1 = max(0, min(ix1, grid_w - 1))
+                ix2 = max(ix1 + 1, min(ix2, grid_w))
+                iy1 = max(0, min(iy1, grid_h - 1))
+                iy2 = max(iy1 + 1, min(iy2, grid_h))
+                region = token_map[batch_idx, iy1:iy2, ix1:ix2].reshape(-1, channels)
+                sample_tokens.append(region.mean(dim=0))
+            if sample_tokens:
+                tokens_per_batch.append(torch.stack(sample_tokens, dim=0))
+            else:
+                tokens_per_batch.append(token_map[batch_idx].reshape(-1, channels).mean(dim=0)[None])
+        return torch.stack(tokens_per_batch, dim=0)
+
+    def forward(
+        self,
+        patch_tokens: torch.Tensor,
+        bboxes: torch.Tensor | None,
+        grid_h: int,
+        grid_w: int,
+        image_h: int,
+        image_w: int,
+    ) -> torch.Tensor:
+        proto_tokens = self._box_tokens(
+            patch_tokens,
+            bboxes,
+            grid_h,
+            grid_w,
+            image_h,
+            image_w,
+        )
+
+        proto_tokens = self.proto_norm(
+            proto_tokens
+            + self.residual_scale * self.proto_to_image(proto_tokens, patch_tokens, patch_tokens)
+        )
+        patch_tokens = self.image_norm(
+            patch_tokens
+            + self.residual_scale * self.image_to_proto(patch_tokens, proto_tokens, proto_tokens)
+        )
+        return patch_tokens
+
+
 class DINOv3Adapter(nn.Module):
     def __init__(
         self,
@@ -81,6 +165,7 @@ class DINOv3Adapter(nn.Module):
         freeze_encoder=True,
         pretrained_weights=None,
         conv_inplane=16,
+        mutual_adapter_layers=1,
     ):
         super().__init__()
 
@@ -138,11 +223,22 @@ class DINOv3Adapter(nn.Module):
 
 
         self.pos_encode = PositionEmbeddingSine(num_pos_feats=embed_dim)
+        num_heads = dinov3_configs[model_size]["num_heads"]
+        self.mutual_adapters = nn.ModuleList(
+            [
+                MutualAwareTokenAdapter(
+                    embed_dim,
+                    num_heads,
+                )
+                for _ in range(int(mutual_adapter_layers))
+            ]
+        )
 
 
     def forward(
         self,
         x: torch.Tensor,
+        bboxes: torch.Tensor | None = None,
     ) :
         """
         输入:
@@ -190,10 +286,14 @@ class DINOv3Adapter(nn.Module):
             all_layers = [all_layers[0], all_layers[0], all_layers[0], all_layers[0]]
 
         sem_feats = []
+        class_tokens = []
         num_scales = len(all_layers) - 2
 
         for i, sem_feat in enumerate(all_layers):
-            feat, _ = sem_feat
+            feat, class_token = sem_feat
+            for adapter in self.mutual_adapters:
+                feat = adapter(feat, bboxes, H_c, W_c, x.shape[2], x.shape[3])
+            class_tokens.append(class_token)
 
             # ViT token -> feature map
             # feat: [B, N, C] -> [B, C, H/16, W/16]
@@ -238,5 +338,6 @@ class DINOv3Adapter(nn.Module):
         return {
             'vision_features':vision_features,
             'backbone_fpn':backbone_fpn,
-            'vision_pos_enc':vision_pos_enc
+            'vision_pos_enc':vision_pos_enc,
+            'semantic_anchor': class_tokens[-1] if class_tokens else c4.flatten(2).mean(dim=-1),
         }
