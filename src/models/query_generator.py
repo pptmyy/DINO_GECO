@@ -1,4 +1,5 @@
 from typing import Tuple
+from typing import Optional
 
 import torch
 
@@ -15,7 +16,10 @@ class QueryGenerator(nn.Module):
             *,
             transformer_dim: int,
             num_prototype_attn_steps: int,
-            num_image_attn_steps: int
+            num_image_attn_steps: int,
+            output_stride: int = 4,
+            num_prototypes: int = 4,
+            prototype_ema_momentum: float = 0.9,
 
     ) -> None:
         super().__init__()
@@ -58,7 +62,12 @@ class QueryGenerator(nn.Module):
             self.image_attention_l2.append(MSDeformAttn(
                 d_model=transformer_dim, n_levels=1, n_heads=8, n_points=8))
 
-        self.scale_query_aggregator = ScaleAwareQueryAggregator(transformer_dim)
+        self.scale_query_aggregator = ScaleAwareQueryAggregator(
+            transformer_dim,
+            output_stride=output_stride,
+            num_prototypes=num_prototypes,
+            prototype_ema_momentum=prototype_ema_momentum,
+        )
 
     def init_weights(m):
         if isinstance(m, nn.Linear):
@@ -103,10 +112,14 @@ class QueryGenerator(nn.Module):
             hq_features: torch.Tensor,
             hq_prototypes: torch.Tensor,
             hq_pos: torch.Tensor,
+            semantic_context: Optional[torch.Tensor] = None,
+            prototype_memory: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
 
         """
+        if len(hq_features) < 2 or len(hq_prototypes) < 2 or len(hq_pos) < 2:
+            raise ValueError("QueryGenerator expects l1/l2 high-resolution features and prototypes")
         b, c, h, w = image_embeddings.shape
         _, _, h1, w1 = hq_features[0].shape
         _, _, h2, w2 = hq_features[1].shape
@@ -138,25 +151,34 @@ class QueryGenerator(nn.Module):
         hq_features_l2 = hq_features[1].flatten(2).permute(0, 2, 1)
 
         for layer in self.prototype_attention:
-            src = layer(image_f=src,
-                        prototypes=prototype_embeddings)
+            src = layer(image_f=src, prototypes=prototype_embeddings)
 
         for layer in self.prototype_attention_l1:
-            hq_features_l1 = layer(image_f=hq_features_l1,
-                                   prototypes=hq_prototypes[0])
+            hq_features_l1 = layer(image_f=hq_features_l1, prototypes=hq_prototypes[0])
 
         for layer in self.prototype_attention_l2:
-            hq_features_l2 = layer(image_f=hq_features_l2,
-                                   prototypes=hq_prototypes[1])
+            hq_features_l2 = layer(image_f=hq_features_l2, prototypes=hq_prototypes[1])
 
         for layer in self.image_attention:
-            src = layer((src+image_pe), reference_points, src, spatial_shapes, level_start_index)
+            src = layer((src + image_pe), reference_points, src, spatial_shapes, level_start_index)
 
         for layer in self.image_attention_l1:
-            hq_features_l1 = layer((hq_features_l1 +hq_features_l1_pos), reference_points1, hq_features_l1, spatial_shapes1, level_start_index1)
+            hq_features_l1 = layer(
+                (hq_features_l1 + hq_features_l1_pos),
+                reference_points1,
+                hq_features_l1,
+                spatial_shapes1,
+                level_start_index1,
+            )
 
         for layer in self.image_attention_l2:
-            hq_features_l2 = layer((hq_features_l2+hq_features_l2_pos), reference_points2, hq_features_l2, spatial_shapes2, level_start_index2)
+            hq_features_l2 = layer(
+                (hq_features_l2 + hq_features_l2_pos),
+                reference_points2,
+                hq_features_l2,
+                spatial_shapes2,
+                level_start_index2,
+            )
 
         src = src.transpose(1, 2).reshape(b, c, h, w)
         hq_features_l2 = hq_features_l2.transpose(1, 2).view(b, c, h2, w2)
@@ -168,6 +190,8 @@ class QueryGenerator(nn.Module):
             q1=hq_features_l1,
             prototype_embeddings=prototype_embeddings,
             hq_prototypes=hq_prototypes,
+            semantic_context=semantic_context,
+            prototype_memory=prototype_memory,
         )
 
         return src, src_aux

@@ -12,6 +12,7 @@ class VerificationStats:
     threshold: float
     score_gamma: float
     hard_filter_applied: bool
+    soft_filter_applied: bool
     candidate_count: int
     kept_count: int
     filtered_count: int
@@ -34,6 +35,7 @@ def _stats(
     candidate_count: int,
     kept_count: int,
     verification_scores: Optional[torch.Tensor] = None,
+    soft_filter_applied: bool = False,
 ) -> VerificationStats:
     if verification_scores is None or verification_scores.numel() == 0:
         score_min = 0.0
@@ -51,6 +53,7 @@ def _stats(
         threshold=float(threshold),
         score_gamma=float(score_gamma),
         hard_filter_applied=bool(hard_filter_applied),
+        soft_filter_applied=bool(soft_filter_applied),
         candidate_count=int(candidate_count),
         kept_count=int(kept_count),
         filtered_count=int(candidate_count - kept_count),
@@ -110,6 +113,32 @@ def _feature_scores(candidate_features: torch.Tensor, exemplar_features: torch.T
     exemplar_features = torch.nn.functional.normalize(exemplar_features, dim=-1)
     similarity = candidate_features @ exemplar_features.transpose(-1, -2)
     return similarity.max(dim=-1).values
+
+
+def _filter_exemplar_features(
+    exemplar_features: torch.Tensor,
+    exemplar_boxes: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if exemplar_boxes is None or exemplar_boxes.numel() == 0:
+        return exemplar_features
+
+    valid_mask = _valid_box_mask(exemplar_boxes.to(device=exemplar_features.device))
+    if valid_mask.numel() == 0:
+        return exemplar_features[:0]
+
+    feature_count = exemplar_features.shape[0]
+    box_count = valid_mask.numel()
+    if feature_count == box_count:
+        return exemplar_features[valid_mask]
+
+    if box_count > 0 and feature_count % box_count == 0:
+        tokens_per_box = feature_count // box_count
+        token_mask = valid_mask.repeat_interleave(tokens_per_box)
+        return exemplar_features[token_mask]
+
+    # If features were already pre-filtered or came from a non-standard extractor,
+    # keep them rather than silently applying a wrong mask.
+    return exemplar_features
 
 
 def verify_detections(
@@ -180,10 +209,7 @@ def verify_detections(
             device=boxes.device,
             dtype=boxes.dtype,
         )
-        if exemplar_boxes is not None and exemplar_boxes.numel() > 0:
-            valid_mask = _valid_box_mask(exemplar_boxes.to(device=boxes.device))
-            if valid_mask.numel() == exemplar_features.shape[0]:
-                exemplar_features = exemplar_features[valid_mask]
+        exemplar_features = _filter_exemplar_features(exemplar_features, exemplar_boxes)
         if exemplar_features.numel() == 0:
             stats = _stats(
                 mode=mode,
@@ -243,15 +269,20 @@ def verify_detections(
 
     keep = torch.ones_like(verification_scores, dtype=torch.bool)
     hard_filter_applied = False
+    soft_filter_applied = False
     if threshold > 0 and filter_mode == "hard":
         hard_filter_applied = True
     elif threshold > 0 and filter_mode == "sparse_hard":
         hard_filter_applied = int(hard_candidate_limit) > 0 and candidate_count <= int(
             hard_candidate_limit
         )
+    elif threshold > 0 and filter_mode == "soft":
+        soft_filter_applied = True
 
     if hard_filter_applied:
         keep = keep & (verification_scores >= float(threshold))
+    if soft_filter_applied:
+        keep = keep & (scores >= float(threshold))
 
     if (min_area_ratio > 0 or max_area_ratio > 0) and exemplar_boxes_valid is not None:
         eps = torch.finfo(boxes.dtype).eps
@@ -280,6 +311,7 @@ def verify_detections(
         threshold=threshold,
         score_gamma=score_gamma,
         hard_filter_applied=hard_filter_applied,
+        soft_filter_applied=soft_filter_applied,
         candidate_count=candidate_count,
         kept_count=int(boxes_out.shape[0]),
         verification_scores=verification_scores,

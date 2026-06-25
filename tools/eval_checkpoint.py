@@ -4,7 +4,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import torch
 from PIL import Image
@@ -31,6 +31,29 @@ from tools.diagnostics import (
     write_count_bin_csv,
     write_json,
     write_top_errors_csv,
+)
+
+
+CHECKPOINT_META_KEYS = (
+    "epoch",
+    "best_val_rmse",
+    "best_val_mae",
+    "best_val_loss",
+    "best_val_ap50_iou50",
+    "best_val_f1_iou50",
+    "best_val_gated_rmse",
+    "best_val_gated_mae",
+    "val_mae",
+    "val_rmse",
+    "val_loss",
+    "val_ap50_iou50",
+    "val_f1_iou50",
+    "test_mae",
+    "test_rmse",
+    "test_ap50_iou50",
+    "test_f1_iou50",
+    "query_output_stride",
+    "use_semantic_anchor",
 )
 
 
@@ -76,10 +99,74 @@ def make_dataset(args):
         tiling_p=args.tiling_p,
         zero_shot=args.zero_shot,
         training=False,
+        allow_missing_coco=args.allow_missing_coco,
+        exemplar_scale_mode=args.exemplar_scale_mode,
     )
     if args.split == "train":
         dataset.split = "test"
     return dataset
+
+
+def build_selection_report(
+    args,
+    *,
+    summary: Dict[str, object],
+    model: torch.nn.Module,
+    coco_metrics: Dict[str, Any],
+    output_dir: Path,
+) -> Dict[str, object]:
+    checkpoint = args.checkpoint or str(Path(args.model_path) / f"{args.model_name}.pth")
+    checkpoint_meta = getattr(model, "_dgeco_checkpoint_meta", {}) or {}
+    selected_checkpoint_meta = {
+        key: checkpoint_meta.get(key)
+        for key in CHECKPOINT_META_KEYS
+        if key in checkpoint_meta
+    }
+    protocol_config = {
+        "model_name": args.model_name,
+        "query_output_stride": int(getattr(args, "query_output_stride", 4)),
+        "use_semantic_anchor": bool(getattr(args, "use_semantic_anchor", False)),
+        "score_threshold": args.score_threshold,
+        "score_ratio": args.score_ratio,
+        "threshold_mode": args.threshold_mode,
+        "score_quantile": args.score_quantile,
+        "pre_nms_topk": args.pre_nms_topk,
+        "max_detections": args.max_detections,
+        "nms_iou": args.nms_iou,
+        "nms_method": args.nms_method,
+        "verification_mode": args.verification_mode,
+        "verification_threshold": args.verification_threshold,
+        "verification_filter_mode": args.verification_filter_mode,
+        "coco_eval": bool(args.coco_eval),
+        "coco_max_dets": args.coco_max_dets,
+    }
+    artifacts = {
+        "args": str(output_dir / "args.json"),
+        "summary": str(output_dir / "summary.json"),
+        "summary_by_count_bin": str(output_dir / "summary_by_count_bin.csv"),
+        "top_abs_errors": str(output_dir / "top_abs_errors.csv"),
+        "per_image_predictions": str(output_dir / "per_image_predictions.jsonl"),
+        "coco_metrics": str(output_dir / "coco_metrics.json"),
+        "selection_report": str(output_dir / "selection_report.json"),
+    }
+    return {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "protocol": "P0",
+        "selection_policy": (
+            "Keep count-best, detection-best, loss-best, gated-count-best, and last "
+            "checkpoints separate; compare checkpoints only under the recorded protocol."
+        ),
+        "split": args.split,
+        "checkpoint": checkpoint,
+        "checkpoint_metadata": selected_checkpoint_meta,
+        "protocol_config": protocol_config,
+        "evaluated_metrics": {
+            "overall": summary.get("overall"),
+            "count_bins": summary.get("count_bins"),
+            "coco": coco_metrics,
+        },
+        "artifacts": artifacts,
+    }
 
 
 def evaluate(args) -> Dict[str, object]:
@@ -142,6 +229,9 @@ def evaluate(args) -> Dict[str, object]:
                     pre_nms_topk=args.pre_nms_topk,
                     max_detections=args.max_detections,
                     nms_iou=args.nms_iou,
+                    nms_method=args.nms_method,
+                    soft_nms_sigma=args.soft_nms_sigma,
+                    soft_nms_score_threshold=args.soft_nms_score_threshold,
                     min_box_area=args.min_box_area,
                     max_box_area=args.max_box_area,
                     adaptive_sparse_score_ratio=args.adaptive_sparse_score_ratio,
@@ -229,8 +319,9 @@ def evaluate(args) -> Dict[str, object]:
     write_count_bin_csv(output_dir / "summary_by_count_bin.csv", summary)
     write_top_errors_csv(output_dir / "top_abs_errors.csv", records, args.top_k_errors)
 
+    coco_metrics: Dict[str, Any]
     if args.coco_eval:
-        run_coco_bbox_eval(
+        coco_metrics = run_coco_bbox_eval(
             instances_path=get_instances_path(dataset, args.split),
             detections=coco_detections,
             image_ids=coco_eval_image_ids,
@@ -238,6 +329,27 @@ def evaluate(args) -> Dict[str, object]:
             category_id=args.coco_category_id,
             max_dets=args.coco_max_dets,
         )
+    else:
+        coco_metrics = {
+            "enabled": False,
+            "reason": "--coco-eval was not set",
+            "image_count": int(seen),
+            "detection_count": int(len(coco_detections)),
+            "category_id": int(args.coco_category_id),
+            "requested_max_dets": int(args.coco_max_dets),
+        }
+        write_json(output_dir / "coco_metrics.json", coco_metrics)
+
+    write_json(
+        output_dir / "selection_report.json",
+        build_selection_report(
+            args,
+            summary=summary_dict,
+            model=model,
+            coco_metrics=coco_metrics,
+            output_dir=output_dir,
+        ),
+    )
 
     return summary_dict
 
