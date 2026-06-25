@@ -1,20 +1,10 @@
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
 
 logs/
-outputs/
-checkpoints/
-
-*.pth
-*.pt
-*.ckpt
-*.onnx
-*.zip
-
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-
+eval_runs/
+sweep_outputs/
+data/
+checkpoint/
 *.log
-*.tmp
